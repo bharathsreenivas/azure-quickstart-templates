@@ -15,6 +15,9 @@ OS_VERSION=$(lsb_release -sr)
 if [[ $OS_VERSION == 14* ]]; then
     echo "OS verion is $OS_VERSION. Using hue-binaries-14-04."
     HUE_TARFILE=hue-binaries-14-04.tgz
+elif [[ $OS_VERSION == 16* ]]; then
+    echo "OS verion is $OS_VERSION. Using hue-binaries-16-04."
+    HUE_TARFILE=hue-binaries-16-04.tgz
 fi
 
 HUE_TARFILEURI=https://hdiconfigactions.blob.core.windows.net/linuxhueconfigactionv01/$HUE_TARFILE
@@ -22,6 +25,9 @@ HUE_TMPFOLDER=/tmp/hue
 HUE_INSTALLFOLDER=/usr/share/hue
 HUE_INIPATH=$HUE_INSTALLFOLDER/desktop/conf/hue.ini
 ACTIVEAMBARIHOST=headnodehost
+
+#import helper module.
+wget -O /tmp/HDInsightUtilities-v01.sh -q https://hdiconfigactions.blob.core.windows.net/linuxconfigactionmodulev01/HDInsightUtilities-v01.sh && source /tmp/HDInsightUtilities-v01.sh && rm -f /tmp/HDInsightUtilities-v01.sh
 
 usage() {
     echo ""
@@ -136,9 +142,35 @@ setupWebWasbService() {
     chown -R webwasb:webwasb $WEBWASB_INSTALLFOLDER
 
     cp -f $WEBWASB_INSTALLFOLDER/upstart/webwasb.conf /etc/init/
-    initctl reload-configuration
-    stop webwasb
-    start webwasb
+	cat >/etc/systemd/system/multi-user.target.wants/webwasb.service <<EOL
+[[Unit]
+Description=webwasb service
+
+[Service]
+Type=simple
+User=webwasb
+Group=webwasb
+Restart=always
+RestartSec=5
+Environment="JAVA_HOME=$JAVA_HOME"
+Environment="CATALINA_HOME=/usr/share/webwasb-tomcat"
+ExecStart=/usr/share/webwasb-tomcat/bin/catalina.sh run
+ExecStopPost=rm -rf $CATALINA_HOME/temp/*
+
+[Install]
+WantedBy=multi-user.target
+EOL
+	if [[ $OS_VERSION == 16* ]]; then
+	    echo "Using systemd configuration"
+		systemctl daemon-reload
+		systemctl stop webwasb.service    
+		systemctl start webwasb.service
+	else
+	    echo "Using upstart configuration"
+        initctl reload-configuration
+		stop webwasb
+		start webwasb
+    fi    
 }
 
 downloadAndUnzipHue() {
@@ -179,22 +211,30 @@ setupHueService() {
 
     sed -i "s|DEFAULTFSPLACEHOLDER|$defaultfs|g" $HUE_INIPATH
     
-    rm1node=$(sed -n '/<name>yarn.resourcemanager.hostname.rm1/,/<\/value>/p' $YARNSITEPATH)
-    rm2node=$(sed -n '/<name>yarn.resourcemanager.hostname.rm2/,/<\/value>/p' $YARNSITEPATH)
+    PRIMARYHEADNODE=`get_primary_headnode`
+	SECONDARYHEADNODE=`get_secondary_headnode`
     
-    rm1Host=$(sed -n -e 's/.*<value>\(.*\)<\/value>.*/\1/p' <<< $rm1node)
-    rm2Host=$(sed -n -e 's/.*<value>\(.*\)<\/value>.*/\1/p' <<< $rm2node)
+	#Check if values retrieved are empty, if yes, exit with error
+	if [[ -z $PRIMARYHEADNODE ]]; then
+	echo "Could not determine primary headnode."
+	exit 139
+	fi
     
-    echo "headnode 0 = $rm1Host"
-    echo "headnode 1 = $rm2Host"
-    sed -i "s|http://headnode0:8088|http://$rm1Host:8088|g" $HUE_INIPATH
-    sed -i "s|http://headnode1:8088|http://$rm2Host:8088|g" $HUE_INIPATH
+	if [[ -z $SECONDARYHEADNODE ]]; then
+	echo "Could not determine secondary headnode."
+	exit 140
+	fi
+    
+    echo "primary headnode = $PRIMARYHEADNODE"
+    echo "secondary headnode = $SECONDARYHEADNODE"
+    sed -i "s|http://headnode0:8088|http://$PRIMARYHEADNODE:8088|g" $HUE_INIPATH
+    sed -i "s|http://headnode1:8088|http://$SECONDARYHEADNODE:8088|g" $HUE_INIPATH
 
-    sed -i "s|## hive_server_host=localhost|hive_server_host=$rm1Host|g" $HUE_INIPATH
-    sed -i "s|## oozie_url=http://localhost:11000/oozie|oozie_url=http://$rm1Host:11000/oozie|g" $HUE_INIPATH
-    sed -i "s|## proxy_api_url=http://localhost:8088|proxy_api_url=http://$rm1Host:8088|g" $HUE_INIPATH
-    sed -i "s|## history_server_api_url=http://localhost:19888|history_server_api_url=http://$rm1Host:19888|g" $HUE_INIPATH
-    sed -i "s|## jobtracker_host=localhost|jobtracker_host=$rm1Host|g" $HUE_INIPATH
+    sed -i "s|## hive_server_host=localhost|hive_server_host=$PRIMARYHEADNODE|g" $HUE_INIPATH
+    sed -i "s|## oozie_url=http://localhost:11000/oozie|oozie_url=http://$PRIMARYHEADNODE:11000/oozie|g" $HUE_INIPATH
+    sed -i "s|## proxy_api_url=http://localhost:8088|proxy_api_url=http://$PRIMARYHEADNODE:8088|g" $HUE_INIPATH
+    sed -i "s|## history_server_api_url=http://localhost:19888|history_server_api_url=http://$PRIMARYHEADNODE:19888|g" $HUE_INIPATH
+    sed -i "s|## jobtracker_host=localhost|jobtracker_host=$PRIMARYHEADNODE|g" $HUE_INIPATH
 
     echo "Adding hue user"
     useradd -r hue
@@ -202,9 +242,30 @@ setupHueService() {
 
     echo "Making Hue a service and start it"
     cp $HUE_INSTALLFOLDER/upstart/hue.conf /etc/init/
-    initctl reload-configuration
-    stop hue
-    start hue
+    cat >/etc/systemd/system/multi-user.target.wants/hue.service <<EOL
+[[Unit]
+Description=hue service
+
+[Service]
+Type=simple
+User=hue
+Restart=always
+ExecStart=/usr/share/hue/build/env/bin/supervisor
+
+[Install]
+WantedBy=multi-user.target
+EOL
+	if [[ $OS_VERSION == 16* ]]; then
+	    echo "Using systemd configuration"
+		systemctl daemon-reload
+		systemctl stop hue.service    
+		systemctl start hue.service
+	else
+	    echo "Using upstart configuration"
+        initctl reload-configuration
+        stop hue
+        start hue
+    fi
 }
 
 ##############################
@@ -226,7 +287,11 @@ if [ -e $HUE_INSTALLFOLDER ]; then
     exit 0
 fi
 
-echo JAVA_HOME=$JAVA_HOME
+if [[ $OS_VERSION == 14* ]]; then
+    export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
+elif [[ $OS_VERSION == 16* ]]; then
+    export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+fi
 
 checkHostNameAndSetClusterName
 validateUsernameAndPassword
@@ -247,3 +312,4 @@ startServiceViaRest HDFS
 
 setupWebWasbService
 setupHueService
+
